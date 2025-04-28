@@ -1,0 +1,467 @@
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+import warnings  # To suppress divide-by-zero warnings safely
+
+
+class CutCellOceanModel2D_NonUniform_Expanded:
+    """
+    A conceptual 2D (x-z slice) ocean model demonstrating cut cells (hFac)
+    on a non-uniform, structured grid. Includes T/S tracers, linear EOS,
+    hydrostatic pressure, vertical velocity from continuity, basic momentum tendency
+    (pressure gradient, viscosity, forcing), vertical advection/diffusion, and time stepping.
+
+    NOTE: Momentum advection is omitted for simplicity. Vertical velocity is diagnosed
+          from horizontal flow divergence (continuity). Uses upwind advection.
+    """
+
+    def __init__(self, x_face_coords, z_face_coords, bathy_func,
+                 dt=60.0, Kh=1.0, Kv=1e-4, Ah=10.0, Av=1e-3,
+                 rho0=1025.0, g=9.81, alpha=2e-4, beta=7.4e-4, T0=10.0, S0=35.0,
+                 wind_stress_tau_x=0.0, bottom_drag_coeff=1e-3):
+        """
+        Initializes the model grid, geometry, parameters, and state variables.
+
+        Args:
+            x_face_coords (np.array): 1D array of x-coordinates of vertical cell faces.
+            z_face_coords (np.array): 1D array of z-coordinates of horizontal cell faces
+                                       (surface=0, increasing negative downwards).
+            bathy_func (callable): Function h(x) returning water depth (positive value).
+                                    Must be vectorized or handle array input.
+            dt (float): Time step (seconds).
+            Kh (float): Horizontal tracer diffusivity (m^2/s).
+            Kv (float): Vertical tracer diffusivity (m^2/s).
+            Ah (float): Horizontal momentum viscosity (m^2/s).
+            Av (float): Vertical momentum viscosity (m^2/s).
+            rho0 (float): Reference density (kg/m^3).
+            g (float): Acceleration due to gravity (m/s^2).
+            alpha (float): Thermal expansion coefficient (1/degC).
+            beta (float): Haline contraction coefficient (1/PSU).
+            T0, S0 (float): Reference temperature and salinity for EOS.
+            wind_stress_tau_x (float or callable): Surface wind stress in x (N/m^2).
+                                                   If callable, tau_x(x) is used.
+            bottom_drag_coeff (float): Quadratic bottom drag coefficient (dimensionless).
+        """
+        print("Initializing CutCellOceanModel2D_NonUniform_Expanded...")
+        # --- Grid Coordinates ---
+        self.x_face = np.asarray(x_face_coords)
+        self.z_face = np.asarray(z_face_coords)
+        self.nx = len(self.x_face) - 1
+        self.nz = len(self.z_face) - 1
+
+        if self.nx <= 0 or self.nz <= 0:
+            raise ValueError("Must have at least one cell in each dimension.")
+        if not np.all(np.diff(self.x_face) > 0):
+            raise ValueError("x_face_coords must be monotonically increasing.")
+        if not np.all(np.diff(self.z_face) < 0):
+            raise ValueError("z_face_coords must be monotonically decreasing.")
+
+        # --- Grid Cell Centers and Dimensions ---
+        self.x_center = (self.x_face[:-1] + self.x_face[1:]) / 2.0
+        self.z_center = (self.z_face[:-1] + self.z_face[1:]) / 2.0
+        self.dx = np.diff(self.x_face)  # Size nx array
+        self.dz = -np.diff(self.z_face)  # Size nz array (positive thickness)
+        self.dxf = np.diff(self.x_center)  # Distance between cell centers i and i+1
+        self.dzf = -np.diff(self.z_center)  # Distance between cell centers k and k+1 (positive)
+
+        # --- Bathymetry ---
+        self.bathy_func = bathy_func
+        self.bathy_depth_c = -self.bathy_func(self.x_center)  # At cell center x
+        self.bathy_depth_w = -self.bathy_func(self.x_face[:-1])  # At west face x
+        self.bathy_depth_e = -self.bathy_func(self.x_face[1:])  # At east face x
+
+        # --- Geometric Factors, Masks, Centroids ---
+        self.cell_area = np.outer(self.dx, self.dz)
+        self.hFacC = np.zeros((self.nx, self.nz))  # Volume (Area in 2D) fraction at Center
+        self.hFacW = np.zeros((self.nx, self.nz))  # Area fraction at West face
+        self.hFacS = np.zeros((self.nx, self.nz))  # Area fraction at South (Bottom in 2D) face
+        self.wet_area = np.zeros((self.nx, self.nz))  # dx*dz*hFacC
+        self.wet_face_area_x = np.zeros((self.nx, self.nz))  # dz*hFacW (at West face i)
+        self.wet_face_area_z = np.zeros((self.nx, self.nz))  # dx*hFacS (at Bottom face k)
+        self.maskC = np.zeros((self.nx, self.nz), dtype=int)  # Cell Center
+        self.maskW = np.zeros((self.nx, self.nz), dtype=int)  # West Face i
+        self.maskS = np.zeros((self.nx, self.nz), dtype=int)  # South (Bottom) Face k
+        self.centroid_x = np.full((self.nx, self.nz), np.nan)
+        self.centroid_z = np.full((self.nx, self.nz), np.nan)
+        self.dist_cen_x = np.full((self.nx, self.nz), np.nan)  # Distance between centroids i and i-1
+        self.dist_cen_z = np.full((self.nx, self.nz), np.nan)  # Distance between centroids k and k+1
+
+        self._calculate_geometry_and_centroids()
+        self._calculate_centroid_distances()  # Needs centroids first
+
+        # --- Physical Parameters ---
+        self.dt = dt
+        self.Kh = Kh
+        self.Kv = Kv
+        self.Ah = Ah
+        self.Av = Av
+        self.rho0 = rho0
+        self.g = g
+        self.alpha = alpha
+        self.beta = beta
+        self.T0 = T0
+        self.S0 = S0
+        self.wind_stress_tau_x = wind_stress_tau_x
+        self.bottom_drag_coeff = bottom_drag_coeff
+
+        # --- State Variables ---
+        # Tracers at cell centers (centroids)
+        self.T = np.full((self.nx, self.nz), self.T0) * self.maskC
+        self.S = np.full((self.nx, self.nz), self.S0) * self.maskC
+        # Velocity on faces
+        self.u = np.zeros((self.nx, self.nz))  # U on west face i
+        self.w = np.zeros((self.nx, self.nz))  # W on bottom face k (diagnosed)
+        # Auxiliary fields at centers
+        self.pressure = np.zeros((self.nx, self.nz))  # Hydrostatic pressure anomaly (relative to surface)
+        self.density = np.full((self.nx, self.nz), self.rho0) * self.maskC
+
+        # Tendencies (storage for updates)
+        self.T_tendency = np.zeros((self.nx, self.nz))
+        self.S_tendency = np.zeros((self.nx, self.nz))
+        self.u_tendency = np.zeros((self.nx, self.nz))
+
+        # --- Diagnostic variables ---
+        self.ke = np.zeros((self.nx, self.nz))   # Kinetic Energy
+
+        print("Initialization complete.")
+        print(f"Grid: {self.nx}x{self.nz}. dt={self.dt}s.")
+        print(f"Kh={self.Kh:.2e}, Kv={self.Kv:.2e}, Ah={self.Ah:.2e}, Av={self.Av:.2e}")
+
+    def _calculate_geometry_and_centroids(self):
+        # (This method is largely unchanged from the original, but ensure refinement happens at the end)
+        print("Calculating geometric factors (hFac) and centroids...")
+        full_face_area_x = self.dz  # West/East face area depends only on k -> shape (nz,)
+        full_face_area_z = self.dx  # Bottom/Top face area depends only on i -> shape (nx,)
+
+        for i in range(self.nx):
+            for k in range(self.nz):
+                # Cell boundaries
+                z_top_face = self.z_face[k]
+                z_bot_face = self.z_face[k + 1]
+                x_west_face = self.x_face[i]
+                x_east_face = self.x_face[i + 1]
+                dz_k = self.dz[k]
+                dx_i = self.dx[i]
+                full_area_ik = self.cell_area[i, k]
+
+                bathy_c = self.bathy_depth_c[i]
+                bathy_w = self.bathy_depth_w[i]
+                bathy_e = self.bathy_depth_e[i]
+
+                # hFacC and maskC
+                if z_top_face < bathy_c:
+                    hFacC = 0.0
+                elif z_bot_face >= bathy_c:
+                    hFacC = 1.0
+                else:
+                    hFacC = np.clip((bathy_c - z_bot_face) / dz_k, 0.0, 1.0)
+                self.hFacC[i, k] = hFacC
+                self.maskC[i, k] = 1 if hFacC > 1e-10 else 0
+                self.wet_area[i, k] = full_area_ik * hFacC
+
+                # hFacW and maskW (Initial estimate based on bathy_w)
+                if z_top_face < bathy_w:
+                    hFacW = 0.0
+                elif z_bot_face >= bathy_w:
+                    hFacW = 1.0
+                else:
+                    hFacW = np.clip((bathy_w - z_bot_face) / dz_k, 0.0, 1.0)
+                self.hFacW[i, k] = hFacW
+                self.maskW[i, k] = 1 if hFacW > 1e-10 else 0
+                self.wet_face_area_x[i, k] = full_face_area_x[k] * hFacW
+
+                # hFacS and maskS (Initial estimate based on bathy_c)
+                # Bottom face is open if the face itself is below the water at that location
+                # Use bathy_c as approximation for bathy depth over the face
+                bathy_at_z_bot = bathy_c
+                if z_bot_face < bathy_at_z_bot:
+                    hFacS = 1.0
+                else:
+                    hFacS = 0.0
+                self.hFacS[i, k] = hFacS
+                self.maskS[i, k] = 1 if hFacS > 1e-10 else 0
+                self.wet_face_area_z[i, k] = full_face_area_z[i] * hFacS
+
+                # --- Calculate Centroid (cx, cz) ---
+                if self.maskC[i, k] == 0:
+                    self.centroid_x[i, k], self.centroid_z[i, k] = np.nan, np.nan
+                    continue
+
+                z_bathy_at_west = np.clip(bathy_w, z_bot_face, z_top_face)
+                z_bathy_at_east = np.clip(bathy_e, z_bot_face, z_top_face)
+                h_wet_west = np.clip(z_bathy_at_west - z_bot_face, 0.0, dz_k)
+                h_wet_east = np.clip(z_bathy_at_east - z_bot_face, 0.0, dz_k)
+
+                if hFacC >= 1.0 - 1e-10:  # Fully wet
+                    cx = self.x_center[i]
+                    cz = self.z_center[k]
+                elif hFacC > 1e-10:  # Partially wet
+                    trapezoid_area = (h_wet_west + h_wet_east) / 2.0 * dx_i
+                    if trapezoid_area < 1e-12 or abs(h_wet_west + h_wet_east) < 1e-12:
+                        cx = self.x_center[i]
+                        cz = z_bot_face + hFacC * dz_k * 0.5  # Approx centroid of partial cell
+                    else:
+                        cx = x_west_face + dx_i * (h_wet_east + 2 * h_wet_west) / (3 * (h_wet_west + h_wet_east))
+                        cz = z_bot_face + (h_wet_west ** 2 + h_wet_west * h_wet_east + h_wet_east ** 2) / (
+                                3 * (h_wet_west + h_wet_east))
+
+                    cx = np.clip(cx, x_west_face + 1e-9, x_east_face - 1e-9)  # Ensure within bounds
+                    cz = np.clip(cz, z_bot_face + 1e-9, z_top_face - 1e-9)
+                else:  # Effectively dry
+                    cx, cz = np.nan, np.nan
+
+                self.centroid_x[i, k] = cx
+                self.centroid_z[i, k] = cz
+
+        # --- Refine face masks based on adjacent *wet cells* ---
+        print("Refining face masks based on connectivity...")
+        # West face maskW[i,k] needs C[i,k] AND C[i-1,k] to be wet.
+        self.maskW[0, :] = 0  # Domain boundary
+        self.wet_face_area_x[0, :] = 0.0
+        for i in range(1, self.nx):
+            connectivity_mask = self.maskC[i, :] * self.maskC[i - 1, :]
+            self.maskW[i, :] = self.maskW[i, :] * connectivity_mask  # Combine geometric and connectivity
+            self.wet_face_area_x[i, self.maskW[i, :] == 0] = 0.0  # Zero area if not connected or geometrically blocked
+
+        # Bottom face maskS[i,k] needs C[i,k] AND C[i,k+1] to be wet.
+        self.maskS[:, -1] = 0  # Domain boundary (bottom)
+        self.wet_face_area_z[:, -1] = 0.0
+        for k in range(self.nz - 1):
+            connectivity_mask = self.maskC[:, k] * self.maskC[:, k + 1]
+            self.maskS[:, k] = self.maskS[:, k] * connectivity_mask  # Combine geometric and connectivity
+            self.wet_face_area_z[self.maskS[:, k] == 0, k] = 0.0  # Zero area if not connected or geometrically blocked
+
+        print("Geometric factors and centroid calculation complete.")
+
+    def _calculate_centroid_distances(self):
+        """Calculate distances between adjacent cell centroids."""
+        print("Calculating centroid distances...")
+        # Distance between centroid(i,k) and centroid(i-1,k)
+        self.dist_cen_x[1:, :] = self.centroid_x[1:, :] - self.centroid_x[:-1, :]
+        self.dist_cen_x[self.dist_cen_x <= 1e-10] = np.nan  # Avoid zero/small distance
+
+        # Distance between centroid(i,k) and centroid(i,k+1) (negative z-coord difference)
+        self.dist_cen_z[:, :-1] = self.centroid_z[:, :-1] - self.centroid_z[:, 1:]
+        self.dist_cen_z[self.dist_cen_z <= 1e-10] = np.nan  # Avoid zero/small distance
+        print("Centroid distance calculation complete.")
+
+    def get_recip_wet_area(self):
+        """ Safely calculates 1.0 / wet_area, returning 0 where wet_area is 0. """
+        recip = np.zeros_like(self.wet_area)
+        wet = self.wet_area > 1e-15
+        recip[wet] = 1.0 / self.wet_area[wet]
+        return recip
+
+    def _linear_eos(self, T, S):
+        """ Simple linear equation of state. """
+        return self.rho0 * (1.0 - self.alpha * (T - self.T0) + self.beta * (S - self.S0))
+
+    def update_density_pressure(self):
+        """ Updates density from T/S and calculates hydrostatic pressure anomaly. """
+        self.density = self._linear_eos(self.T, self.S) * self.maskC
+
+        # Integrate hydrostatic pressure downwards
+        # p(k) = p(k-1) + rho(k-1)*g*dz(k-1) (approx)
+        # More accurately: use average density between levels or integrate rho*g dz
+        # Simplified approach: Pressure at center k depends on density of cells above
+        self.pressure[:, :] = 0.0  # Start with zero at the surface reference
+        for k in range(1, self.nz):
+            # Pressure difference across layer k-1 (top face k to top face k-1)
+            # Use density of the layer above (k-1) and thickness dz[k-1]
+            # Apply only where both cell k and k-1 are wet for integration path
+            mask_k_and_km1 = self.maskC[:, k] * self.maskC[:, k - 1]
+            # Average density (simple) or density at k-1? Let's use density at k-1
+            rho_eff = self.density[:, k - 1]
+            # Effective thickness: dz[k-1]? Centroid distance? Use dz[k-1] for simplicity.
+            delta_p = rho_eff * self.g * self.dz[k - 1]
+            self.pressure[:, k] = self.pressure[:, k - 1] + delta_p * mask_k_and_km1
+
+        self.pressure *= self.maskC  # Ensure dry cells have no pressure anomaly
+
+    def diagnose_vertical_velocity(self):
+        """Calculates vertical velocity W on bottom face 'k' to ensure volume conservation."""
+        # div(Flux) = d(u*dz)/dx + d(w*dx)/dz = 0
+        # Integral form: Sum(fluxes) = 0
+        # Flux_East - Flux_West + Flux_North - Flux_South = 0
+        # (u_E * Area_E) - (u_W * Area_W) + (w_N * Area_N) - (w_S * Area_S) = 0
+        # Here, N is top face (k-1), S is bottom face (k). Area_N is wet_face_area_z[i, k-1], Area_S is wet_face_area_z[i, k].
+        # We want w_S = w[i, k] (velocity on bottom face k).
+        # w_S * Area_S = w_N * Area_N + (u_E * Area_E) - (u_W * Area_W)
+        # Note: u_E is u[i+1, k], Area_E is wet_face_area_x[i+1, k]
+        #       u_W is u[i, k],   Area_W is wet_face_area_x[i, k]
+        #       w_N is w[i, k-1]
+
+        self.w[:, :] = 0.0  # Initialize
+        recip_wet_area_z = np.zeros_like(self.wet_face_area_z)
+        valid_z = self.wet_face_area_z > 1e-15
+        recip_wet_area_z[valid_z] = 1.0 / self.wet_face_area_z[valid_z]
+
+        # Integrate divergence downwards from surface (k=0)
+        # Assume w=0 at the effective surface (top face of k=0 cell) -> w[i, -1] = 0 conceptually
+        flux_horiz_div = np.zeros((self.nx, self.nz))
+
+        # Calculate horizontal flux divergence within each layer k
+        flux_W = self.u * self.wet_face_area_x  # Flux across west face i
+        flux_E = np.zeros_like(flux_W)
+        flux_E[:-1, :] = flux_W[1:, :]  # Flux across east face i is west face i+1
+        flux_horiz_div = flux_E - flux_W  # Net horizontal flux *out* of cell (i,k)
+
+        # Integrate vertically: w_flux_S(k) = w_flux_N(k) + horiz_div(k)
+        w_flux_N = np.zeros(self.nx)  # Flux across top face of current layer (starts at 0 for k=0)
+        for k in range(self.nz):
+            w_flux_S = w_flux_N + flux_horiz_div[:, k]  # Total flux needing to exit bottom face k
+            # Convert flux to velocity: w = Flux / Area
+            self.w[:, k] = w_flux_S * recip_wet_area_z[:, k] * self.maskS[:, k]  # Apply mask for bottom face
+            # Flux leaving bottom face k becomes flux entering top face k+1
+            w_flux_N = w_flux_S * self.maskS[:, k]  # Pass only through open faces
+
+        # Ensure w is zero where bottom face is masked
+        self.w *= self.maskS
+
+    def _calculate_tracer_flux_divergence(self, tracer):
+        """ Calculates advective + diffusive flux divergence for a tracer field. """
+        flux_div_adv = np.zeros_like(tracer)
+        flux_div_diff = np.zeros_like(tracer)
+
+        # --- Advection (Upwind) ---
+        # Horizontal Fluxes (East - West)
+        flux_adv_W = np.zeros_like(tracer)
+        flux_adv_E = np.zeros_like(tracer)
+        for i in range(1, self.nx):  # Loop over west faces
+            u_face = self.u[i, :]
+            area_w = self.wet_face_area_x[i, :]
+            mask_w = self.maskW[i, :]
+            tracer_upstream = np.where(u_face > 0, tracer[i - 1, :], tracer[i, :])
+            flux_adv_W[i, :] = u_face * tracer_upstream * area_w * mask_w
+        flux_adv_E[:-1, :] = flux_adv_W[1:, :]  # East face i = West face i+1
+        flux_div_adv += (flux_adv_E - flux_adv_W)
+
+        # Vertical Fluxes (North - South)
+        flux_adv_S = np.zeros_like(tracer)  # Flux across South (bottom) face k
+        flux_adv_N = np.zeros_like(tracer)  # Flux across North (top) face k
+        for k in range(self.nz - 1):  # Loop over bottom faces (except very bottom)
+            w_face = self.w[:, k]  # w on bottom face k
+            area_s = self.wet_face_area_z[:, k]
+            mask_s = self.maskS[:, k]
+            # Upwind: If w>0 (upward), use tracer from k+1. If w<=0 (downward), use tracer from k.
+            tracer_upstream = np.where(w_face > 0, tracer[:, k + 1], tracer[:, k])
+            flux_adv_S[:, k] = w_face * tracer_upstream * area_s * mask_s
+        flux_adv_N[:, 1:] = flux_adv_S[:, :-1]  # North face k = South face k-1
+        flux_div_adv += (flux_adv_N - flux_adv_S)  # Add vertical divergence
+
+        # --- Diffusion ---
+        # Horizontal Diffusion (East - West)
+        flux_diff_W = np.zeros_like(tracer)
+        flux_diff_E = np.zeros_like(tracer)
+        with warnings.catch_warnings():  # Suppress divide by nan warning
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            grad_x = (tracer[1:, :] - tracer[:-1, :]) / self.dist_cen_x[1:, :]  # Gradient between i and i-1
+        grad_x[np.isnan(grad_x)] = 0.0  # Set gradient to 0 if distance was invalid
+        for i in range(1, self.nx):  # Loop over west faces
+            area_w = self.wet_face_area_x[i, :]
+            mask_w = self.maskW[i, :]
+            flux_diff_W[i, :] = -self.Kh * grad_x[i - 1, :] * area_w * mask_w  # Use grad between i-1 and i for face i
+        flux_diff_E[:-1, :] = flux_diff_W[1:, :]
+        flux_div_diff += (flux_diff_E - flux_diff_W)
+
+        # Vertical Diffusion (North - South)
+        flux_diff_S = np.zeros_like(tracer)  # Flux across South (bottom) face k
+        flux_diff_N = np.zeros_like(tracer)  # Flux across North (top) face k
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            # Gradient between k and k+1 (careful with sign convention for dz_c)
+            grad_z = (tracer[:, 1:] - tracer[:, :-1]) / (-self.dist_cen_z[:, :-1])  # dz_c was positive distance
+        grad_z[np.isnan(grad_z)] = 0.0
+        for k in range(self.nz - 1):  # Loop over bottom faces
+            area_s = self.wet_face_area_z[:, k]
+            mask_s = self.maskS[:, k]
+            flux_diff_S[:, k] = -self.Kv * grad_z[:, k] * area_s * mask_s  # Use grad between k and k+1 for face k
+        flux_diff_N[:, 1:] = flux_diff_S[:, :-1]
+        flux_div_diff += (flux_diff_N - flux_diff_S)
+
+        total_flux_div = flux_div_adv + flux_div_diff
+        return total_flux_div * self.maskC  # Return divergence only for wet cells
+
+    def calculate_tracer_tendency(self):
+        """ Calculates tendencies for T and S. """
+        recip_wet_area = self.get_recip_wet_area()
+        div_T = self._calculate_tracer_flux_divergence(self.T)
+        div_S = self._calculate_tracer_flux_divergence(self.S)
+        self.T_tendency = -div_T * recip_wet_area
+        self.S_tendency = -div_S * recip_wet_area
+
+    def _calculate_pressure_gradient_force(self):
+        """ Calculates pressure gradient force term for u-momentum. (-1/rho0 * dp/dx) """
+        pgf = np.zeros_like(self.u)
+        # Calculate pressure difference across the u-face (west face i)
+        # Uses pressure at centers i and i-1
+        # Need distance between centers i and i-1 --> use self.dxf (approx) or dist_cen_x? Use dist_cen_x.
+        with warnings.catch_warnings():  # Suppress divide by nan warning
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            dp_dx = (self.pressure[1:, :] - self.pressure[:-1, :]) / self.dist_cen_x[1:, :]
+        dp_dx[np.isnan(dp_dx)] = 0.0
+
+        pgf[1:, :] = -(1.0 / self.rho0) * dp_dx
+        return pgf * self.maskW  # Apply only at open west faces
+
+    def _calculate_viscosity_force(self):
+        """ Calculates horizontal and vertical viscosity terms for u-momentum. """
+        visc_force = np.zeros_like(self.u)
+
+        # Horizontal Viscosity: d/dx (Ah * du/dx) at the u-point (west face i)
+        # Needs gradient of u at cell centers, then take divergence at u-point.
+        # Simpler: Calculate Laplacian at u-point using adjacent u-points.
+        # d/dx(du/dx) approx (u[i+1,k] - 2*u[i,k] + u[i-1,k]) / dx_u^2
+        # dx_u is distance between u-points = dx[i] roughly? Use dx array.
+        laplacian_h = np.zeros_like(self.u)
+        dx_u_sq = np.zeros_like(self.u)
+
+        dx_avg = (self.dx[1:] + self.dx[:-1]) / 2.0
+        dx_u_sq[1:, :] = dx_avg[:, np.newaxis] ** 2  # Shape (39, 1)**2 -> broadcasts to (39, 20)
+
+
+        dx_u_sq[dx_u_sq < 1e-15] = np.inf  # Avoid division by zero
+
+        laplacian_h[1:-1, :] = (self.u[2:, :] - 2 * self.u[1:-1, :] + self.u[:-2, :]) / dx_u_sq[1:-1, :]
+        visc_force += self.Ah * laplacian_h
+
+        # Vertical Viscosity: d/dz (Av * du/dz) at the u-point (west face i)
+        # Needs u gradients on horizontal faces above/below u[i,k].
+        # Approx: (u[i,k-1] - 2*u[i,k] + u[i,k+1]) / dz_w^2
+        # dz_w is distance between W-faces = dz[k] roughly? Use dz array.
+        laplacian_v = np.zeros_like(self.u)
+        dz_w_sq = self.dz ** 2  # Thickness squared at level k
+        dz_w_sq[dz_w_sq < 1e-10] = np.inf
+
+        laplacian_v[:, 1:-1] = (self.u[:, :-2] - 2 * self.u[:, 1:-1] + self.u[:, 2:]) / dz_w_sq[1:-1]
+        # Handle boundaries (assume no shear gradient = zero flux)
+        # Top boundary (k=0): gradient = (u[i,1]-u[i,0])/dz[0] -> flux = Av*grad. Need second derivative...
+        # Simplified Neumann zero gradient: Assume effective u[i,-1] = u[i,0]
+        laplacian_v[:, 0] = (self.u[:, 1] - self.u[:, 0]) / dz_w_sq[0]  # One-sided difference approx
+        # Bottom boundary (k=nz-1): Assume effective u[i,nz] = u[i,nz-1]
+        laplacian_v[:, -1] = (self.u[:, -2] - self.u[:, -1]) / dz_w_sq[-1]  # One-sided difference approx
+
+        visc_force += self.Av * laplacian_v
+
+        return visc_force * self.maskW  # Apply only at open west faces
+
+    def _apply_surface_forcing(self, tendency_field, flux_per_area, state_var):
+        """ Applies a surface flux to the tendency of the uppermost wet cell. """
+        tendency_increment = np.zeros_like(tendency_field)
+        recip_wet_area = self.get_recip_wet_area()
+
+        # Determine surface flux value per column
+        if callable(flux_per_area):
+            surface_flux_values = flux_per_area(self.x_center)
+        else:
+            surface_flux_values = np.full(self.nx, flux_per_area)
+
+        for i in range(self.nx):
+            k_surf = -1
+            for k in range(self.nz):  # Find topmost wet cell
+                if self.maskC[i, k] > 0:
+                    k_surf = k
+                    break
+            if k_surf != -1:
+                total_flux_into_cell = surface_flux_values[i] * self.dx[i]  # Flux over dx
+                # Tendency = Flux / Volume = (Flux*dx) / (wet_area
